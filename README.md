@@ -1,6 +1,9 @@
 # BURST a benchmarking platform for uniform random sampling techniques
 
-Demonstration: https://www.youtube.com/watch?v=sSKosyrfitA
+A demonstration of the tool: 
+[![Alt
+text](https://img.youtube.com/vi/sSKosyrfitA/0.jpg)](https://www.youtube.com/watch?v=sSKosyrfitA)
+
 BURST provides Python scripts and Docker environment for evaluating state-of-the-art samplers (KUS, SPUR, Unigen, etc.) and proven statistical test (Barbarik). 
 BURST comes with an extensive --- and extensible --- benchmark dataset comprising 128 feature models, including challenging, real-world models of the Linux kernel.
 
