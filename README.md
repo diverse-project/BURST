@@ -3,7 +3,7 @@
 BURST provides Python scripts and Docker environment for evaluating state-of-the-art feature model and SAT samplers (KUS, SPUR, Unigen, etc.) as well as proven statistical test (Barbarik). 
 BURST comes with an extensive --- and extensible --- benchmark dataset comprising 500+ SAT formuale and feature models, including challenging, real-world models of the Linux kernel. A demonstration of the tool is available: 
 [![Alt
-text](https://img.youtube.com/vi/sSKosyrfitA/1.jpg](https://www.youtube.com/watch?v=sSKosyrfitA)
+text](https://img.youtube.com/vi/sSKosyrfitA/0.jpg](https://www.youtube.com/watch?v=sSKosyrfitA)
 
 ## Usage 
 
