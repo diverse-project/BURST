@@ -3,7 +3,7 @@
 BURST provides Python scripts and Docker environment for evaluating state-of-the-art feature model and SAT samplers (KUS, SPUR, Unigen, etc.) as well as proven statistical test (Barbarik). 
 BURST comes with an extensive --- and extensible --- benchmark dataset comprising 500+ SAT formuale and feature models, including challenging, real-world models of the Linux kernel. A demonstration of the tool is available: 
 [![Alt
-text](https://www.youtube.com/watch?v=sSKosyrfitA)](https://www.youtube.com/watch?v=sSKosyrfitA)
+text](https://img.youtube.com/vi/sSKosyrfitA/1.jpg](https://www.youtube.com/watch?v=sSKosyrfitA)
 
 ## Usage 
 
@@ -20,7 +20,7 @@ For instance, you can interactively used the image `docker run -it -v $(pwd):/ho
 and the scripts are located in `/home/usampling-exp/` 
 
 
-#### Usage (Sampling)
+### Usage (Sampling)
 
 The previous example was to check uniformity. 
 You can also generate samples with some samplers.
@@ -31,6 +31,16 @@ For instance:
 is calling SPUR sampler, with a timeout of 1 second, and with formulas explicitly given (here two formulas: useful to focus on specific formulas). 
 You can also specify a folder.
 Without `flas` default formulas contained in the Docker folder/subfolders `/home/samplingfm/` are processed (around 500 files).
+
+Typical outcomes are:
+
+```
+cat usampling-data/experiments-KUS.csv
+formula_file,timeout,execution_time_in,dnnf_time,sampling_time,model_count,counting_time,dnnfparsing_time
+/home/samplingfm/Benchmarks/FeatureModels/FM-3.6.1-refined.cnf,False, 0.1399824619293213, 0.011404275894165039, 0.0007951259613037109, 26256, 0.0008006095886230469, 0.0012776851654052734
+```
+
+The meaning of columns of the CSV file is as follows: `formula_file': the name of the processed model; `timeout': whether a timeout has been reached or not; `execution_time_in' overall execution time; `dnnf_time': the time required by KUS to compile the corresponding DNNF formula; `sampling_time': time taken to produce the samples; `model_count': the number of solutions in the model; `counting\_time': time taken to count solutions; `dnnfparsing_time': time taken to parse the compiled DNNF formula. All times are reported in seconds.
 
 ### Usage (Uniformity)
 
