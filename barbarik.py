@@ -1,1133 +1,1 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-# Copyright (C) 2018 Kuldeep Meel
-#
-# This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; version 2
-# of the License.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-# 02110-1301, USA.
-
-from __future__ import print_function
-import sys
-import os
-import math
-import random
-import argparse
-import copy
-import tempfile
-import pandas as pd
-import re
-
-SAMPLER_UNIGEN = 1
-SAMPLER_QUICKSAMPLER = 2
-SAMPLER_STS = 3
-SAMPLER_CMS = 4
-SAMPLER_UNIGEN3 = 5
-SAMPLER_SPUR = 6
-SAMPLER_SMARCH = 7
-SAMPLER_UNIGEN2 = 8
-SAMPLER_KUS = 9
-SAMPLER_DISTAWARE = 10
-
-CURR_REF_SAMPLER = 6  # default is SPUR
-
-P_THREADS = 4
-
-# We need a dictionary for Distribution-aware distance sampling
-# which records names and not feature ids in outputted samples
-features_dict = {}
-
-
-def create_features_dict(inputFile):
-    nb_vars = 0
-    with open(inputFile, 'r') as f:
-        lines = f.readlines()
-    for line in lines:
-        if line.startswith("c") and not line.startswith("c ind"):
-            line = line[0:len(line) - 1]
-            _feature = line.split(" ", 4)
-            del _feature[0]
-            # handling non-numeric feature IDs, necessary to parse os-like models with $ in feature names...
-            if len(_feature) <= 2 and len(_feature) > 0:  # needs to deal with literate comments, e.g., in V15 models
-                if (_feature[0].isdigit()):
-                    _feature[0] = int(_feature[0])
-                else:
-                    # num_filter = filter(_feature[0].isdigit(), _feature[0])
-                    num_feature = "".join(c for c in _feature[0] if c.isdigit())
-                    _feature[0] = int(num_feature)
-                    # print('key ' +  str(_feature[1]) +  ' value ' + str(_feature[0])) -- debug
-                    global features_dict
-                features_dict.update({str(_feature[1]): str(_feature[0])})
-        elif line.startswith('p cnf'):
-            _line = line.split(" ", 4)
-            nb_vars = int(_line[2])
-            print("there are : " + str(nb_vars) + " integer variables")
-    if (len(features_dict.keys()) == 0):
-        print("could not create dict from comments, faking it with integer variables in the 'p cnf' header")
-        for i in range(1, nb_vars + 1):
-            # global features_dict
-            features_dict.update({str(i): str(i)})
-
-
-def get_sampler_string(samplerType):
-    if samplerType == SAMPLER_UNIGEN:
-        return 'UniGen'
-    if samplerType == SAMPLER_UNIGEN3:
-        return 'UniGen3'
-    if samplerType == SAMPLER_QUICKSAMPLER:
-        return 'QuickSampler'
-    if samplerType == SAMPLER_STS:
-        return 'STS'
-    if samplerType == SAMPLER_CMS:
-        return 'CustomSampler'
-    if samplerType == SAMPLER_SPUR:
-        return 'SPUR'
-    if samplerType == SAMPLER_SMARCH:
-        return 'SMARCH'
-    if samplerType == SAMPLER_UNIGEN2:
-        return 'UNIGEN2'
-    if samplerType == SAMPLER_KUS:
-        return 'KUS'
-    if samplerType == SAMPLER_DISTAWARE:
-        return 'DistanceBasedSampling'
-    print("ERROR: unknown sampler type")
-    exit(-1)
-
-
-class ChainFormulaSetup:
-    def __init__(self, countList, newVarList, indicatorLits):
-        self.countList = countList
-        self.newVarList = newVarList
-        self.indicatorLits = indicatorLits
-
-
-def check_cnf(fname):
-    with open(fname, 'r') as f:
-        lines = f.readlines()
-
-    given_vars = None
-    given_cls = None
-    cls = 0
-    max_var = 0
-    for line in lines:
-        line = line.strip()
-
-        if len(line) == 0:
-            print("ERROR: CNF is incorrectly formatted, empty line!")
-            return False
-
-        line = line.split()
-        line = [l.strip() for l in line]
-
-        if line[0] == "p":
-            assert len(line) == 4
-            assert line[1] == "cnf"
-            given_vars = int(line[2])
-            given_cls = int(line[3])
-            continue
-
-        if line[0] == "c":
-            continue
-
-        cls += 1
-        for l in line:
-            var = abs(int(l))
-            max_var = max(var, max_var)
-
-    if max_var > given_vars:
-        print("ERROR: Number of variables given is LESS than the number of variables ued")
-        print("ERROR: Vars in header: %d   max var: %d" % (given_vars, max_var))
-        return False
-
-    if cls != given_cls:
-        print("ERROR: Number of clauses in header is DIFFERENT than the number of clauses in the CNF")
-        print("ERROR: Claues in header: %d   clauses: %d" % (given_cls, cls))
-        return False
-
-    return True
-
-
-class SolutionRetriver:
-
-    @staticmethod
-    def getSolutionFromSampler(inputFile, numSolutions, samplerType, indVarList, newSeed):
-        topass_withseed = (inputFile, numSolutions, indVarList, newSeed)
-        ok = check_cnf(inputFile)
-        if not ok:
-            print("ERROR: CNF is malformatted. Sampler may give wrong solutions in this case. Exiting.")
-            print("File is: %s" % inputFile)
-            exit(-1)
-
-        print("Using sampler: %s" % get_sampler_string(samplerType))
-        if (samplerType == SAMPLER_UNIGEN):
-            sols = SolutionRetriver.getSolutionFromUniGen(*topass_withseed)
-
-        elif (samplerType == SAMPLER_UNIGEN3):
-            sols = SolutionRetriver.getSolutionFromUniGen3(*topass_withseed)
-
-        elif (samplerType == SAMPLER_QUICKSAMPLER):
-            sols = SolutionRetriver.getSolutionFromQuickSampler(*topass_withseed)
-
-        elif (samplerType == SAMPLER_STS):
-            sols = SolutionRetriver.getSolutionFromSTS(*topass_withseed)
-
-        elif (samplerType == SAMPLER_CMS):
-            sols = SolutionRetriver.getSolutionFromCMSsampler(*topass_withseed)
-
-        elif (samplerType == SAMPLER_SPUR):
-            sols = SolutionRetriver.getSolutionFromSpur(*topass_withseed)
-
-        elif (samplerType == SAMPLER_SMARCH):
-            sols = SolutionRetriver.getSolutionFromSMARCH(*topass_withseed)
-
-        elif (samplerType == SAMPLER_UNIGEN2):
-            sols = SolutionRetriver.getSolutionFromUniGen2(*topass_withseed)
-
-        elif (samplerType == SAMPLER_KUS):
-            sols = SolutionRetriver.getSolutionFromKUS(*topass_withseed)
-
-        elif (samplerType == SAMPLER_DISTAWARE):
-            sols = SolutionRetriver.getSolutionFromDistAware(*topass_withseed)
-
-        else:
-            print("Error: No such sampler!")
-            exit(-1)
-
-        # clean up the solutions
-        for i in range(len(sols)):
-            sols[i] = sols[i].strip()
-            if sols[i].endswith(' 0'):
-                sols[i] = sols[i][:-2]
-
-        print("Number of solutions returned by sampler:", len(sols))
-        # if args.verbose:
-        # print("Solutions:", sols)
-        return sols
-
-    @staticmethod
-    def getSolutionFromUniGen(inputFile, numSolutions, indVarList, newSeed):
-        # must construct ./unigen --samples=500 --verbosity=0 --threads=1  CNF-FILE SAMPLESFILE
-        inputFileSuffix = inputFile.split('/')[-1][:-4]
-        tempOutputFile = tempfile.gettempdir() + '/' + inputFileSuffix + ".txt"
-
-        cmd = './samplers/unigen --samples=' + str(numSolutions)
-        cmd += ' ' + inputFile + ' ' + str(tempOutputFile) + ' > /dev/null 2>&1'
-        if args.verbose:
-            print("cmd: ", cmd)
-        os.system(cmd)
-
-        with open(tempOutputFile, 'r') as f:
-            lines = f.readlines()
-
-        solList = []
-        for line in lines:
-            line = line.strip()
-            if line.startswith('v'):
-                freq = int(line.split(':')[-1])
-                for i in range(freq):
-                    solList.append(line.split(':')[0].replace('v', '').strip())
-                    if (len(solList) == numSolutions):
-                        break
-                if (len(solList) == numSolutions):
-                    break
-        solreturnList = solList
-        if (len(solList) > numSolutions):
-            solreturnList = random.sample(solList, numSolutions)
-
-        os.unlink(str(tempOutputFile))
-        return solreturnList
-
-    @staticmethod
-    def getSolutionFromUniGen2(inputFile, numSolutions, indVarList, newSeed):
-
-        inputFileSuffix = inputFile.split('/')[-1][:-4]
-        tempOutputFile = tempfile.gettempdir() + '/' + inputFileSuffix + ".txt"
-        cwd = os.getcwd()
-        cmd = 'python3  UniGen2.py -samples=' + str(numSolutions)
-        cmd += ' ' + str(os.path.abspath(inputFile)) + ' ' + str(tempfile.gettempdir()) + ' > /dev/null 2>&1'
-        if args.verbose:
-            print("cmd: ", cmd)
-        os.chdir(str(os.getcwd()) + '/samplers')
-        os.system(cmd)
-        os.chdir(str(cwd))
-
-        with open(tempOutputFile, 'r') as f:
-            lines = f.readlines()
-
-        solList = []
-        for line in lines:
-            line = line.strip()
-            if line.startswith('v'):
-                freq = int(line.split(':')[-1])
-                for i in range(freq):
-                    solList.append(line.split(':')[0].replace('v', '').strip())
-                    if (len(solList) == numSolutions):
-                        break
-                if (len(solList) == numSolutions):
-                    break
-        solreturnList = solList
-        if (len(solList) > numSolutions):
-            solreturnList = random.sample(solList, numSolutions)
-
-        os.unlink(str(tempOutputFile))
-        return solreturnList
-
-    @staticmethod
-    def getSolutionFromKUS(inputFile, numSolutions, indVarList, newSeed):
-
-        inputFileSuffix = inputFile.split('/')[-1][:-4]
-        tempOutputFile = tempfile.gettempdir() + '/' + inputFileSuffix + ".txt"
-        cwd = os.getcwd()
-        cmd = 'python3  KUS.py --samples=' + str(numSolutions) + ' ' + '--outputfile ' + tempOutputFile
-        cmd += ' ' + str(os.path.abspath(inputFile)) + ' > /dev/null 2>&1'
-        if args.verbose:
-            print("cmd: ", cmd)
-        os.chdir(str(os.getcwd()) + '/samplers')
-        os.system(cmd)
-        os.chdir(str(cwd))
-
-        with open(tempOutputFile, 'r') as f:
-            lines = f.readlines()
-
-        solList = []
-
-        for line in lines:
-            sol = re.sub('[0-9]*,', '', line)
-            solList.append(sol)
-
-        os.unlink(str(tempOutputFile))
-
-        return solList
-
-    @staticmethod
-    def getSolutionFromUniGen3(inputFile, numSolutions, indVarList, newSeed):
-        # must construct: ./approxmc3 -s 1 -v2 --sampleout /dev/null --samples 500
-        inputFileSuffix = inputFile.split('/')[-1][:-4]
-        tempOutputFile = tempfile.gettempdir() + '/' + inputFileSuffix + ".txt"
-
-        cmd = './samplers/approxmc3 -s ' + str(int(newSeed)) + ' -v 0 --samples ' + str(numSolutions)
-        cmd += ' --sampleout ' + str(tempOutputFile)
-        cmd += ' ' + inputFile + ' > /dev/null 2>&1'
-        if args.verbose:
-            print("cmd: ", cmd)
-        os.system(cmd)
-
-        with open(tempOutputFile, 'r') as f:
-            lines = f.readlines()
-
-        solList = []
-        for line in lines:
-            line = line.strip()
-            freq = int(line.split(':')[0])
-            for i in range(freq):
-                solList.append(line.split(':')[1].strip())
-                if len(solList) == numSolutions:
-                    break
-            if len(solList) == numSolutions:
-                break
-
-        solreturnList = solList
-        if len(solList) > numSolutions:
-            solreturnList = random.sample(solList, numSolutions)
-
-        os.unlink(str(tempOutputFile))
-        return solreturnList
-
-    @staticmethod
-    def getSolutionFromDistAware(inputFile, numSolutions, indVarList, newSeed):
-
-        inputFileSuffix = inputFile.split('/')[-1][:-4]
-        tempOutputFile = tempfile.gettempdir() + '/' + inputFileSuffix + ".txt"
-
-        # creating the file to configure the sampler
-        dbsConfigFile = tempfile.gettempdir() + '/' + inputFileSuffix + ".a"
-
-        with open(dbsConfigFile, 'w+') as f:
-            f.write("log " + tempfile.gettempdir() + '/' + "output.txt" + "\n")
-            f.write("dimacs " + str(os.path.abspath(inputFile)) + "\n")
-            params = " solver z3" + "\n"
-            params += "hybrid distribution-aware distance-metric:manhattan distribution:uniform onlyBinary:true onlyNumeric:false"
-            params += " selection:SolverSelection number-weight-optimization:1"
-            params += " numConfigs:" + str(numSolutions)
-            f.write(params + "\n")
-            f.write("printconfigs " + tempOutputFile)
-
-        cmd = "mono ./samplers/distribution-aware/CommandLine.exe "
-        cmd += dbsConfigFile
-
-        if args.verbose:
-            print("cmd: ", cmd)
-        os.system(cmd)
-
-        with open(tempOutputFile, 'r') as f:
-            lines = f.readlines()
-
-        solList = []
-
-        for line in lines:
-            features = re.findall("%\w+%", line)
-            sol = []
-
-            for feature in features:
-                feat = feature[1:-1]
-                sol.append(feat)
-
-            solution = ''
-
-            for k, v in features_dict.items():
-                if k in sol:
-                    solution += ' ' + str(v)
-                else:
-                    solution += ' -' + str(v)
-            solList.append(solution)
-
-        # cleaning temporary files
-        os.unlink(str(tempOutputFile))
-        os.unlink(dbsConfigFile)
-        os.unlink(str(tempfile.gettempdir()) + '/' + "output.txt")
-        os.unlink(str(tempfile.gettempdir()) + '/' + "output.txt_error")
-
-        return solList
-
-    @staticmethod
-    def getSolutionFromQuickSampler(inputFile, numSolutions, indVarList, newSeed):
-        cmd = "./samplers/quicksampler -n " + str(numSolutions * 5) + ' ' + str(inputFile) + ' > /dev/null 2>&1'
-        if args.verbose:
-            print("cmd: ", cmd)
-        os.system(cmd)
-        cmd = "./samplers/z3-quicksampler/z3 sat.quicksampler_check=true sat.quicksampler_check.timeout=3600.0 " + str(
-            inputFile) + ' > /dev/null 2>&1'
-        # os.system(cmd)
-
-        # cmd = "./samplers/z3 "+str(inputFile)#+' > /dev/null 2>&1'
-        if args.verbose:
-            print("cmd: ", cmd)
-        os.system(cmd)
-        if (numSolutions > 1):
-            i = 0
-
-        with open(inputFile + '.samples', 'r') as f:
-            lines = f.readlines()
-
-        with open(inputFile + '.samples.valid', 'r') as f:
-            validLines = f.readlines()
-
-        solList = []
-        for j in range(len(lines)):
-            if (validLines[j].strip() == '0'):
-                continue
-            fields = lines[j].strip().split(':')
-            sol = ''
-            i = 0
-            # valutions are 0 and 1 and in the same order as c ind.
-            for x in list(fields[1].strip()):
-                if (x == '0'):
-                    sol += ' -' + str(indVarList[i])
-                else:
-                    sol += ' ' + str(indVarList[i])
-                i += 1
-            solList.append(sol)
-            if (len(solList) == numSolutions):
-                break
-
-        os.unlink(inputFile + '.samples')
-        os.unlink(inputFile + '.samples.valid')
-
-        if len(solList) != numSolutions:
-            print("Did not find required number of solutions")
-            sys.exit(1)
-
-        return solList
-
-    @staticmethod
-    def getSolutionFromSpur(inputFile, numSolutions, indVarList, newSeed):
-        inputFileSuffix = inputFile.split('/')[-1][:-4]
-        tempOutputFile = tempfile.gettempdir() + '/' + inputFileSuffix + ".out"
-        cmd = './samplers/spur -seed %d -q -s %d -out %s -cnf %s' % (
-            newSeed, numSolutions, tempOutputFile, inputFile)
-        if args.verbose:
-            print("cmd: ", cmd)
-        os.system(cmd)
-
-        with open(tempOutputFile, 'r') as f:
-            lines = f.readlines()
-
-        solList = []
-        startParse = False
-        for line in lines:
-            if (line.startswith('#START_SAMPLES')):
-                startParse = True
-                continue
-            if (not (startParse)):
-                continue
-            if (line.startswith('#END_SAMPLES')):
-                startParse = False
-                continue
-            fields = line.strip().split(',')
-            solCount = int(fields[0])
-            sol = ' '
-            i = 1
-            for x in list(fields[1]):
-                if (x == '0'):
-                    sol += ' -' + str(i)
-                else:
-                    sol += ' ' + str(i)
-                i += 1
-            for i in range(solCount):
-                solList.append(sol)
-
-        os.unlink(tempOutputFile)
-        return solList
-
-    @staticmethod
-    def getSolutionFromSTS(inputFile, numSolutions, indVarList, newSeed):
-        kValue = 50
-        samplingRounds = numSolutions / kValue + 1
-        inputFileSuffix = inputFile.split('/')[-1][:-4]
-        outputFile = tempfile.gettempdir() + '/' + inputFileSuffix + ".out"
-        cmd = './samplers/STS -k=' + str(kValue) + ' -nsamples=' + str(samplingRounds) + ' ' + str(inputFile)
-        cmd += ' > ' + str(outputFile)
-        if args.verbose:
-            print("cmd: ", cmd)
-        os.system(cmd)
-
-        with open(outputFile, 'r') as f:
-            lines = f.readlines()
-
-        solList = []
-        shouldStart = False
-        # baseList = {}
-        for j in range(len(lines)):
-            if (lines[j].strip() == 'Outputting samples:' or lines[j].strip() == 'start'):
-                shouldStart = True
-                continue
-            if (lines[j].strip().startswith('Log') or lines[j].strip() == 'end'):
-                shouldStart = False
-            if (shouldStart):
-
-                '''if lines[j].strip() not in baseList:
-                    baseList[lines[j].strip()] = 1
-                else:
-                    baseList[lines[j].strip()] += 1'''
-                sol = ''
-                i = 0
-                # valutions are 0 and 1 and in the same order as c ind.
-                for x in list(lines[j].strip()):
-                    if (x == '0'):
-                        sol += ' -' + str(indVarList[i])
-                    else:
-                        sol += ' ' + str(indVarList[i])
-                    i += 1
-                solList.append(sol)
-                if len(solList) == numSolutions:
-                    break
-
-        if len(solList) != numSolutions:
-            print(len(solList))
-            print("STS Did not find required number of solutions")
-            sys.exit(1)
-
-        os.unlink(outputFile)
-        return solList
-
-    @staticmethod
-    def getSolutionFromCMSsampler(inputFile, numSolutions, indVarList, newSeed):
-        inputFileSuffix = inputFile.split('/')[-1][:-4]
-        outputFile = tempfile.gettempdir() + '/' + inputFileSuffix + ".out"
-        cmd = "./samplers/cryptominisat5 --restart luby --maple 0 --verb 10 --nobansol"
-        cmd += " --scc 1 -n1 --presimp 0 --polar rnd --freq 0.9999"
-        cmd += " --random " + str(int(newSeed)) + " --maxsol " + str(numSolutions)
-        cmd += " " + inputFile
-        cmd += " --dumpresult " + outputFile + " > /dev/null 2>&1"
-
-        if args.verbose:
-            print("cmd: ", cmd)
-        os.system(cmd)
-
-        with open(outputFile, 'r') as f:
-            lines = f.readlines()
-
-        solList = []
-        for line in lines:
-            if line.strip() == 'SAT':
-                continue
-
-            sol = ""
-            lits = line.split(" ")
-            for y in indVarList:
-                if str(y) in lits:
-                    sol += ' ' + str(y)
-
-                if "-" + str(y) in lits:
-                    sol += ' -' + str(y)
-            solList.append(sol)
-
-        solreturnList = solList
-        if len(solList) > numSolutions:
-            solreturnList = random.sample(solList, numSolutions)
-        if len(solList) < numSolutions:
-            print("cryptominisat5 Did not find required number of solutions")
-            sys.exit(1)
-        os.unlink(outputFile)
-        return solreturnList
-
-    @staticmethod
-    def getSolutionFromSMARCH(inputFile, numSolutions, indVarList, newSeed):
-        cmd = "python3 ./samplers/smarch_mp.py -p " + str(P_THREADS) + " -o " + os.path.dirname(
-            inputFile) + " " + inputFile + " " + str(numSolutions) + " > /dev/null 2>&1"
-        # cmd = "python3 /home/gilles/ICST2019-EMSE-Ext/Kclause_Smarch-local/Smarch/smarch.py " + " -o " + os.path.dirname(inputFile) + " " + inputFile + " " + str(numSolutions)
-        if args.verbose:
-            print("cmd: ", cmd)
-        os.system(cmd)
-        # if (numSolutions > 1):
-        #   i = 0
-        solList = []
-        tempFile = inputFile.replace('.cnf', '_' + str(numSolutions)) + '.samples'
-        if args.verbose:
-            print(tempFile)
-
-        df = pd.read_csv(tempFile, header=None)
-
-        # with open(inputFile+'.samples', 'r') as f:
-        #   lines = f.readlines()
-        for x in df.values:
-            # tmpLst = []
-            lst = x.tolist()
-            sol = ''
-            for i in lst:
-                if not math.isnan(i):
-                    sol += ' ' + str(int(i))
-            # tmpList = [str(int(i)) for i in lst if not math.isnan(i)]
-        # if args.verbose:
-        #    print(sol)
-
-        # solList.append(tmpList)
-        # solList = [x for x in df.values]
-        os.unlink(tempFile)
-        solList.append(sol)
-
-        return solList
-
-
-# returns List of Independent Variables
-def parseIndSupport(indSupportFile):
-    with open(indSupportFile, 'r') as f:
-        lines = f.readlines()
-
-    indList = []
-    numVars = 0
-    for line in lines:
-        if line.startswith('p cnf'):
-            fields = line.split()
-            numVars = int(fields[2])
-
-        if line.startswith('c ind'):
-            line = line.strip().replace('c ind', '').replace(' 0', '').strip().replace('v ', '')
-            indList.extend(line.split())
-
-    if len(indList) == 0:
-        indList = [int(x) for x in range(1, numVars + 1)]
-    else:
-        indList = [int(x) for x in indList]
-    return indList
-
-
-def chainFormulaSetup(sampleSol, unifSol, numSolutions):
-    # number of solutions for each: k1, k2, k3
-    # TODO rename to chainSolutions
-    countList = [5, 5, 5]
-
-    # chain formula number of variables for each
-    # TODO rename to chainVars
-    newVarList = [4, 4, 4]
-
-    ##########
-    # clean up the solutions
-    ##########
-    sampleSol = sampleSol[0].strip()
-    if sampleSol.endswith(' 0'):
-        sampleSol = sampleSol[:-2]
-    unifSol = unifSol[0].strip()
-    if unifSol.endswith(' 0'):
-        unifSol = unifSol[:-2]
-
-    # adding more chain formulas (at most 8 in total: 3 + 5)
-    # these chain formulas will have 31 solutions over 6 variables
-    lenSol = len(sampleSol.split())
-    for i in range(min(int(math.log(numSolutions, 2)) + 4, lenSol - 3, 5)):
-        countList.append(31)
-        newVarList.append(6)
-    assert len(countList) == len(newVarList)
-
-    # picking selector literals, i.e. k1, k2, k3, randomly
-    if args.verbose:
-        print("len count list: " + str(len(countList)))
-        print("#num of samples" + str(len(sampleSol.split())))
-
-    assert len(sampleSol.split()) > len(countList), "There are not enough samples to proceed, sampler failed ?"
-    sampleLitList = random.sample(sampleSol.split(), len(countList))
-    unifLitList = []
-    unifSolMap = unifSol.split()
-
-    # from the last version of barbarik...
-    if CURR_REF_SAMPLER == SAMPLER_SPUR:
-        for lit in sampleLitList:
-            unifLitList.append(unifSolMap[abs(int(lit)) - 1])
-    else:
-        # since the reference is not always spur, some adapations are required here
-        for lit in sampleLitList:
-            if lit in unifSolMap:
-                unifLitList.append(lit)
-            elif int(lit) > 0 and str('-' + lit) in unifSolMap:
-                unifLitList.append(str('-' + lit))
-            elif int(lit) < 0 and str(abs(int(lit))) in unifSolMap:
-                unifLitList.append(str(abs(int(lit))))
-            else:
-                print("ERROR in Sampling ! ")
-        # print("appending: " +  unifSolMap[abs(int(lit))-1]+  " for "+  lit)
-        # unifLitList.append(unifSolMap[abs(int(lit))-1])
-
-    assert len(unifLitList) == len(sampleLitList)
-    # print(unifLitList)
-    # print(sampleLitList)
-
-    for a, b in zip(unifLitList, sampleLitList):
-        assert abs(int(a)) == abs(int(b))
-
-    indicatorLits = []
-    indicatorLits.append(sampleLitList)
-    indicatorLits.append(unifLitList)
-
-    # print("countList:", countList)
-    # print("newVarList:", newVarList)
-    # print("indicatorLits:", indicatorLits)
-    return ChainFormulaSetup(countList, newVarList, indicatorLits)
-
-
-def pushVar(variable, cnfClauses):
-    cnfLen = len(cnfClauses)
-    for i in range(cnfLen):
-        cnfClauses[i].append(variable)
-    return cnfClauses
-
-
-def getCNF(variable, binStr, sign, origTotalVars):
-    cnfClauses = []
-    binLen = len(binStr)
-    if sign is False:
-        cnfClauses.append([-(binLen + 1 + origTotalVars)])
-    else:
-        cnfClauses.append([binLen + 1 + origTotalVars])
-
-    for i in range(binLen):
-        newVar = int(binLen - i + origTotalVars)
-        if sign is False:
-            newVar = -1 * (binLen - i + origTotalVars)
-
-        if (binStr[binLen - i - 1] == '0'):
-            cnfClauses.append([newVar])
-        else:
-            cnfClauses = pushVar(newVar, cnfClauses)
-    pushVar(variable, cnfClauses)
-    return cnfClauses
-
-
-def constructChainFormula(originalVar, solCount, newVar, origTotalVars, invert):
-    assert type(solCount) == int
-
-    binStr = str(bin(int(solCount)))[2:-1]
-    binLen = len(binStr)
-    for _ in range(newVar - binLen - 1):
-        binStr = '0' + binStr
-
-    firstCNFClauses = getCNF(-int(originalVar), binStr, invert, origTotalVars)
-    addedClauseNum = 0
-    writeLines = ''
-    for cl in firstCNFClauses:
-        addedClauseNum += 1
-        for lit in cl:
-            writeLines += "%d " % lit
-        writeLines += '0\n'
-
-    return writeLines, addedClauseNum
-
-
-# returns whether new file was created and the list of TMP+OLD independent variables
-def constructNewCNF(inputFile, tempFile, sampleSol, unifSol, chainFormulaConf, indVarList):
-    # which variables are in pos/neg value in the sample
-    sampleVal = {}
-    for i in sampleSol.strip().split():
-        i = int(i)
-        if i != 0:
-            if abs(i) not in indVarList:
-                continue
-
-            sampleVal[abs(i)] = int(i / abs(i))
-
-    # which variables are in pos/neg value in the uniform sample
-    unifVal = {}
-    diffIndex = -1
-    for j in unifSol.strip().split():
-        j = int(j)
-        if j != 0:
-            if abs(j) not in indVarList:
-                continue
-
-            unifVal[abs(j)] = int(j / abs(j))
-
-            if sampleVal[abs(j)] != unifVal[abs(j)]:
-                diffIndex = abs(j)
-
-    # the two solutions are the same
-    # can't do anything, let's do another experiment
-    if diffIndex == -1:
-        return False, None, None
-
-    with open(inputFile, 'r') as f:
-        lines = f.readlines()
-
-    # variables must be shifted by sumNewVar
-    sumNewVar = sum(chainFormulaConf.newVarList)
-
-    # emit the original CNF, but with shifted variables
-    shiftedCNFStr = ''
-    for line in lines:
-        line = line.strip()
-        if line.startswith('p cnf'):
-            numVar = int(line.split()[2])
-            numCls = int(line.split()[3])
-            continue
-
-        if line.startswith('c'):
-            # comment
-            continue
-
-        for x in line.split():
-            x = int(x)
-            if x == 0:
-                continue
-            sign = int(x / abs(x))
-            shiftedCNFStr += "%d " % (sign * (abs(x) + sumNewVar))
-        shiftedCNFStr += ' 0\n'
-    del i
-
-    # Fixing the solution based on splittingVar
-    # X = sigma1 OR X = singma2
-    # All variables are set except for the index where they last differ
-    solClause = ''
-    splittingVar = diffIndex + sumNewVar
-    for var in indVarList:
-        if var != diffIndex:
-            numCls += 2
-            solClause += "%d " % (-splittingVar * sampleVal[diffIndex])
-            solClause += "%d 0\n" % (sampleVal[var] * (var + sumNewVar))
-
-            solClause += "%d " % (-splittingVar * unifVal[diffIndex])
-            solClause += "%d 0\n" % (unifVal[var] * (var + sumNewVar))
-
-    ##########
-    # We add the N number of chain formulas
-    # where chainFormulaConf.indicatorLits must be of size 2
-    # and len(chainFormulaConf.indicatorLits) == len(chainFormulaConf.newVarList)
-    # Adding K soluitons over Z variables, where
-    #    Z = chainFormulaConf.newVarList[k]
-    #    K = chainFormulaConf.countList[k]
-    ##########
-    invert = True
-    seenLits = {}
-    for indicLits in chainFormulaConf.indicatorLits:  # loop runs twice
-        currentNumVar = 0
-        for i in range(len(indicLits)):
-            newvar = chainFormulaConf.newVarList[i]
-            indicLit = int(indicLits[i])
-            addedClause = ''
-            addedClauseNum = 0
-
-            # not adding the chain formula twice to the same literal
-            if indicLit not in seenLits:
-                sign = int(indicLit / abs(indicLit))
-                addedClause, addedClauseNum = constructChainFormula(
-                    sign * (abs(indicLit) + sumNewVar),
-                    chainFormulaConf.countList[i], newvar, currentNumVar,
-                    invert)
-
-            seenLits[indicLit] = True
-            currentNumVar += newvar
-            numCls += addedClauseNum
-            solClause += addedClause
-        invert = not invert
-    del seenLits
-    del invert
-
-    # create "c ind ..." lines
-    oldIndVarList = [x + sumNewVar for x in indVarList]
-    tempIndVarList = copy.copy(oldIndVarList)
-    indIter = 1
-    indStr = 'c ind '
-    for i in range(1, currentNumVar + 1):
-        if indIter % 10 == 0:
-            indStr += ' 0\nc ind '
-        indStr += "%d " % i
-        indIter += 1
-        tempIndVarList.append(i)
-
-    for i in oldIndVarList:
-        if indIter % 10 == 0:
-            indStr += ' 0\nc ind '
-        indStr += "%d " % i
-        indIter += 1
-    indStr += ' 0\n'
-
-    # dump new CNF
-    with open(tempFile, 'w') as f:
-        f.write('p cnf %d %d\n' % (currentNumVar + numVar, numCls))
-        f.write(indStr)
-        f.write(solClause)
-        # f.write("c -- old CNF below -- \n")
-        f.write(shiftedCNFStr)
-
-    # print("New file: ", tempFile)
-    # exit(0)
-
-    return True, tempIndVarList, oldIndVarList
-
-
-class Experiment:
-    def __init__(self, inputFile, maxSamples, minSamples, samplerType, refSamplerType):
-        inputFileSuffix = inputFile.split('/')[-1][:-4]
-        self.tempFile = tempfile.gettempdir() + "/" + inputFileSuffix + "_t.cnf"
-        self.indVarList = parseIndSupport(inputFile)
-        self.inputFile = inputFile
-        self.samplerType = samplerType
-        self.maxSamples = maxSamples
-        self.minSamples = minSamples
-
-        self.samplerString = get_sampler_string(samplerType)
-        self.ref_sampler_type = refSamplerType
-
-    # Returns True if uniform and False otherwise
-    def testUniformity(self, solList, indVarList):
-        solMap = {}
-        baseMap = {}
-        for sol in solList:
-            solution = ''
-            solFields = sol.split()
-            for entry in solFields:
-                if abs(int(entry)) in indVarList:
-                    solution += entry + ' '
-
-            if solution in solMap.keys():
-                solMap[solution] += 1
-            else:
-                solMap[solution] = 1
-
-            if sol not in baseMap.keys():
-                baseMap[sol] = 1
-            else:
-                baseMap[sol] += 1
-
-        if not bool(solMap):
-            print("No Solutions were given to the test")
-            exit(1)
-
-        key = next(iter(solMap))
-
-        print("baseMap: {:<6} numSolutions: {:<6} SolutionsCount: {:<6} loThresh: {:<6} hiThresh: {:<6}".format(
-            len(baseMap.keys()), self.numSolutions, solMap[key], self.loThresh, self.hiThresh))
-
-        if solMap[key] >= self.loThresh and solMap[key] <= self.hiThresh:
-            return True
-        else:
-            return False
-
-    def one_experiment(self, experiment, j, i, numExperiments, tj):
-        self.thresholdSolutions += self.numSolutions
-        if self.thresholdSolutions < self.minSamples:
-            return None, None
-
-        # generate a new seed value for every different (i,j,experiment)
-        newSeed = numExperiments * (i * tj + j) + experiment
-        # get sampler's solutions
-        sampleSol = SolutionRetriver.getSolutionFromSampler(
-            self.inputFile, 1, self.samplerType, self.indVarList, newSeed)
-        self.totalSolutionsGenerated += 1
-
-        # get uniform sampler's solutions
-        # get uniform sampler's solutions
-        # unifSol = SolutionRetriver.getSolutionFromSampler(
-        #   self.inputFile, 1, SAMPLER_SPUR, self.indVarList, newSeed)
-        # self.totalUniformSamples += 1
-
-        # The reference sampler is a now a parameter of barbarik
-        unifSol = SolutionRetriver.getSolutionFromSampler(
-            self.inputFile, 1, self.ref_sampler_type, self.indVarList, newSeed)
-        self.totalUniformSamples += 1
-
-        chainFormulaConf = chainFormulaSetup(sampleSol, unifSol, self.numSolutions)
-        shakuniMix, tempIndVarList, oldIndVarList = constructNewCNF(
-            self.inputFile, self.tempFile, sampleSol[0], unifSol[0],
-            chainFormulaConf, self.indVarList)
-
-        # the two solutions were the same, couldn't construct CNF
-        if not shakuniMix:
-            return False, None
-
-        # seed update
-        newSeed = newSeed + 1
-
-        # get sampler's solutions
-        solList = SolutionRetriver.getSolutionFromSampler(
-            self.tempFile, self.numSolutions, self.samplerType, tempIndVarList, newSeed)
-        os.unlink(self.tempFile)
-        self.totalSolutionsGenerated += self.numSolutions
-
-        isUniform = self.testUniformity(solList, oldIndVarList)
-
-        print("sampler: {:<8s} i: {:<4d} isUniform: {:<4d} TotalSolutionsGenerated: {:<6d}".format(
-            self.samplerString, i, isUniform,
-            self.totalSolutionsGenerated))
-
-        if not isUniform:
-            print("exp:{4} RejectIteration:{0}  Loop:{1} TotalSolutionsGenerated:{2} TotalUniformSamples:{3}".format(
-                i, j, self.totalSolutionsGenerated, self.totalUniformSamples, experiment))
-
-            return True, True
-
-        if self.thresholdSolutions > self.maxSamples:
-            return True, True
-
-        return True, False
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--eta', type=float, help="default = 0.9", default=0.9, dest='eta')
-    parser.add_argument('--epsilon', type=float, help="default = 0.3", default=0.3, dest='epsilon')
-    parser.add_argument('--delta', type=float, help="default = 0.05", default=0.05, dest='delta')
-    parser.add_argument('--sampler', type=int, help=str(SAMPLER_UNIGEN) + " for UniGen;\n" + str(
-        SAMPLER_UNIGEN3) + " for UniGen3 (AppMC3);\n" +
-                                                    str(SAMPLER_QUICKSAMPLER) + " for QuickSampler;\n" + str(
-        SAMPLER_STS) + " for STS;\n" + str(SAMPLER_CMS) + " for CMS;\n" +
-                                                    str(SAMPLER_SPUR) + " for SPUR;\n" + str(
-        SAMPLER_SMARCH) + " for SMARCH;\n" + str(SAMPLER_UNIGEN2) + " for UniGen2;\n" +
-                                                    str(SAMPLER_KUS) + " for KUS;\n" + str(
-        SAMPLER_DISTAWARE) + " for Distance-based Sampling;\n", default=SAMPLER_STS, dest='sampler')
-    parser.add_argument('--ref-sampler', type=int, help=str(SAMPLER_UNIGEN) + " for UniGen;\n" + str(
-        SAMPLER_UNIGEN3) + " for UniGen3 (AppMC3);\n" +
-                                                        str(SAMPLER_QUICKSAMPLER) + " for QuickSampler;\n" + str(
-        SAMPLER_STS) + " for STS;\n" + str(SAMPLER_CMS) + " for CMS;\n" +
-                                                        str(SAMPLER_SPUR) + " for SPUR;\n" + str(
-        SAMPLER_SMARCH) + " for SMARCH;\n" + str(SAMPLER_UNIGEN2) + " for UniGen2;\n" +
-                                                        str(SAMPLER_KUS) + " for KUS;\n" + str(
-        SAMPLER_DISTAWARE) + " for Distance-based Sampling;\n", default=SAMPLER_STS, dest='ref_sampler')
-    parser.add_argument('--reverse', type=int, default=0, help="order to search in", dest='searchOrder')
-    parser.add_argument('--minSamples', type=int, default=0, help="min samples", dest='minSamples')
-    parser.add_argument('--maxSamples', type=int, default=sys.maxsize, help="max samples", dest='maxSamples')
-    parser.add_argument('--seed', type=int, required=True, dest='seed')
-    parser.add_argument('--verb', type=int, dest='verbose')
-    parser.add_argument('--exp', type=int, help="number of experiments", dest='exp', default=1)
-    parser.add_argument("input", help="input file")
-
-    args = parser.parse_args()
-    inputFile = args.input
-
-    eta = args.eta
-    epsilon = args.epsilon
-    if (eta < 2 * epsilon):
-        print("Eta needs to be at least two times epsilon")
-        exit(1)
-    delta = args.delta
-    numExperiments = args.exp
-    if numExperiments == -1:
-        numExperiments = sys.maxsize
-    searchOrder = args.searchOrder
-    verbose = args.verbose
-
-    seed = args.seed
-    random.seed(seed)
-    minSamples = args.minSamples
-    maxSamples = args.maxSamples
-
-    # setting the current reference sampler
-    CURR_REF_SAMPLER = args.sampler
-
-    # preparing features list for distribution-aware sampling
-    if args.sampler == SAMPLER_DISTAWARE:
-        create_features_dict(inputFile)
-
-    totalLoops = int(math.ceil(math.log(2.0 / (eta + 2 * epsilon), 2)) + 1)
-    listforTraversal = range(totalLoops, 0, -1)
-    if searchOrder == 1:
-        listforTraversal = range(1, totalLoops + 1, 1)
-
-    exp = Experiment(
-        minSamples=minSamples, maxSamples=maxSamples, inputFile=inputFile,
-        samplerType=args.sampler, refSamplerType=args.ref_sampler)
-
-    for experiment in range(numExperiments):
-        print("Experiment: {:<5} of {:>5}".format(experiment, numExperiments))
-        breakExperiment = False
-        exp.totalSolutionsGenerated = 0
-        exp.totalUniformSamples = 0
-        exp.thresholdSolutions = 0
-        for j in listforTraversal:
-            tj = math.ceil(
-                math.pow(2, j) * (2 * epsilon + eta) / ((eta - 2 * epsilon) ** 2) * math.log(4.0 / (eta + 2 * epsilon),
-                                                                                             2) * (
-                            4 * math.e / (math.e - 1) * math.log(1.0 / delta)))
-            beta = (math.pow(2, j - 1) + 1) * (eta + 2 * epsilon) * 1.0 / (
-                        4 + (2 * epsilon + eta) * (math.pow(2, j - 1) - 1))
-            gamma = (beta - 2 * epsilon) / 4
-            constantFactor = math.ceil(1 / (8.79 * gamma * gamma))
-            boundFactor = math.log((16) * (math.e / (math.e - 1)) * (1 / (delta * (eta - 2 * epsilon) ** 2)) * math.log(
-                4 / (eta + 2 * epsilon), 2) * math.log(1 / delta), 2)
-            print("constantFactor:{:<4} boundFactor: {:<20} logBoundFactor: {:<20}".format(
-                constantFactor, boundFactor, math.log(boundFactor, 2)))
-            print("tj: {:<6} totalLoops: {:<5} beta: {:<10} epsilon: {:<10}".format(
-                tj, totalLoops, beta, epsilon))
-
-            exp.numSolutions = int(math.ceil(constantFactor * boundFactor))
-            exp.loThresh = int((exp.numSolutions * 1.0 / 2) * (1 - (beta + 2 * epsilon) / 2))
-            exp.hiThresh = int((exp.numSolutions * 1.0 / 2) * (1 + (beta + 2 * epsilon) / 2))
-            print("numSolutions: {:<5} loThresh:{:<6} hiThresh: {:<6}".format(
-                exp.numSolutions, exp.loThresh, exp.hiThresh))
-
-            i = 0
-            breakExperiment = False
-            while i < int(tj) and not breakExperiment:
-                if args.verbose:
-                    print("*** Progress *** " + "i: " + str(i) + " j: " + str(j) + " ---- " + str(j * i) + " / " + str(
-                        len(listforTraversal) * tj))
-                i += 1
-                ok, breakExperiment = exp.one_experiment(experiment, j, i, numExperiments, tj)
-
-                if ok is None:
-                    continue
-
-                if not ok:
-                    i -= 1
-                    continue
-
-                if breakExperiment:
-                    break
-
-            if breakExperiment:
-                break
-
-        if not breakExperiment:
-            print("exp:{2} Accept:1 TotalSolutionsGenerated:{0} TotalUniformSamples:{1}".format(
-                exp.totalSolutionsGenerated,
-                exp.totalUniformSamples, experiment))
-
-        breakExperiment = False
+#!/usr/bin/env python# -*- coding: utf-8 -*-# Copyright (C) 2018 Kuldeep Meel## This program is free software; you can redistribute it and/or# modify it under the terms of the GNU General Public License# as published by the Free Software Foundation; version 2# of the License.## This program is distributed in the hope that it will be useful,# but WITHOUT ANY WARRANTY; without even the implied warranty of# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the# GNU General Public License for more details.## You should have received a copy of the GNU General Public License# along with this program; if not, write to the Free Software# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA# 02110-1301, USA.from __future__ import print_functionimport sysimport osimport mathimport randomimport argparseimport copyimport tempfileimport pandas as pdimport re'''To configure a new sampler to work with Barbarik, please define it here '''SAMPLER_UNIGEN = 1SAMPLER_QUICKSAMPLER = 2SAMPLER_STS = 3SAMPLER_CMS = 4SAMPLER_UNIGEN3 = 5SAMPLER_SPUR = 6SAMPLER_SMARCH = 7SAMPLER_UNIGEN2 = 8SAMPLER_KUS = 9SAMPLER_DISTAWARE = 10CURR_REF_SAMPLER = 6  # default is SPURP_THREADS = 4# We need a dictionary for Distribution-aware distance sampling# which records names and not feature ids in outputted samplesfeatures_dict = {}def create_features_dict(input_file):    nb_vars = 0    with open(input_file, 'r') as f:        lines = f.readlines()    for line in lines:        if line.startswith("c") and not line.startswith("c ind"):            line = line[0:len(line) - 1]            _feature = line.split(" ", 4)            del _feature[0]            # handling non-numeric feature IDs, necessary to parse os-like models with $ in feature names...            if 2 >= len(_feature) > 0:  # needs to deal with literate comments, e.g., in V15 models                if _feature[0].isdigit():                    _feature[0] = int(_feature[0])                else:                    # num_filter = filter(_feature[0].isdigit(), _feature[0])                    num_feature = "".join(c for c in _feature[0] if c.isdigit())                    _feature[0] = int(num_feature)                    # print('key ' +  str(_feature[1]) +  ' value ' + str(_feature[0])) -- debug                    global features_dict                features_dict.update({str(_feature[1]): str(_feature[0])})        elif line.startswith('p cnf'):            _line = line.split(" ", 4)            nb_vars = int(_line[2])            print("there are : " + str(nb_vars) + " integer variables")    if len(features_dict.keys()) == 0:        print("could not create dict from comments, faking it with integer variables in the 'p cnf' header")        for i in range(1, nb_vars + 1):            # global features_dict            features_dict.update({str(i): str(i)})'''To configure a new sampler to work with Barbarik, please define it here '''def get_sampler_string(sampler_type):    if sampler_type == SAMPLER_UNIGEN:        return 'UniGen'    if sampler_type == SAMPLER_UNIGEN3:        return 'UniGen3'    if sampler_type == SAMPLER_QUICKSAMPLER:        return 'QuickSampler'    if sampler_type == SAMPLER_STS:        return 'STS'    if sampler_type == SAMPLER_CMS:        return 'CustomSampler'    if sampler_type == SAMPLER_SPUR:        return 'SPUR'    if sampler_type == SAMPLER_SMARCH:        return 'SMARCH'    if sampler_type == SAMPLER_UNIGEN2:        return 'UNIGEN2'    if sampler_type == SAMPLER_KUS:        return 'KUS'    if sampler_type == SAMPLER_DISTAWARE:        return 'DistanceBasedSampling'    print("ERROR: unknown sampler type")    exit(-1)class ChainFormulaSetup:    def __init__(self, count_list, new_var_list, indicator_lits):        self.countList = count_list        self.newVarList = new_var_list        self.indicatorLits = indicator_litsdef check_cnf(fname):    with open(fname, 'r') as f:        lines = f.readlines()    given_vars = None    given_cls = None    cls = 0    max_var = 0    for line in lines:        line = line.strip()        if len(line) == 0:            print("ERROR: CNF is incorrectly formatted, empty line!")            return False        line = line.split()        line = [li.strip() for li in line]        if line[0] == "p":            assert len(line) == 4            assert line[1] == "cnf"            given_vars = int(line[2])            given_cls = int(line[3])            continue        if line[0] == "c":            continue        cls += 1        for li in line:            var = abs(int(li))            max_var = max(var, max_var)    if max_var > given_vars:        print("ERROR: Number of variables given is LESS than the number of variables ued")        print("ERROR: Vars in header: %d   max var: %d" % (given_vars, max_var))        return False    if cls != given_cls:        print("ERROR: Number of clauses in header is DIFFERENT than the number of clauses in the CNF")        print("ERROR: Claues in header: %d   clauses: %d" % (given_cls, cls))        return False    return True'''This is the class where solution obtained from samplers are fed to Barbarik.  To add a new sampler, in addition to define it as explained above you need to: 1. define a method get_solution_from_XXX(*topass_withseed) in this class. This method need to parse the output of the sampler and create an internal representation fo the list of solutions. Each solution is a list of literals preceded by '-' if is not selected.2. Wrap the call at the beginning of the Class: if/elif blocks.    '''class SolutionRetriver:    @staticmethod    def get_solution_from_sampler(input_file, num_solutions, sampler_type, ind_var_list, new_seed):        topass_withseed = (input_file, num_solutions, ind_var_list, new_seed)        ok = check_cnf(input_file)        if not ok:            print("ERROR: CNF is malformatted. Sampler may give wrong solutions in this case. Exiting.")            print("File is: %s" % input_file)            exit(-1)        print("Using sampler: %s" % get_sampler_string(sampler_type))        if sampler_type == SAMPLER_UNIGEN:            sols = SolutionRetriver.get_solution_from_unigen(*topass_withseed)        elif sampler_type == SAMPLER_UNIGEN3:            sols = SolutionRetriver.get_solution_from_unigen3(*topass_withseed)        elif sampler_type == SAMPLER_QUICKSAMPLER:            sols = SolutionRetriver.get_solution_from_quicksampler(*topass_withseed)        elif sampler_type == SAMPLER_STS:            sols = SolutionRetriver.get_solution_from_sts(*topass_withseed)        elif sampler_type == SAMPLER_CMS:            sols = SolutionRetriver.get_solution_from_cms_sampler(*topass_withseed)        elif sampler_type == SAMPLER_SPUR:            sols = SolutionRetriver.get_solution_from_spur(*topass_withseed)        elif sampler_type == SAMPLER_SMARCH:            sols = SolutionRetriver.get_solution_from_smarch(*topass_withseed)        elif sampler_type == SAMPLER_UNIGEN2:            sols = SolutionRetriver.get_solution_from_unigen2(*topass_withseed)        elif sampler_type == SAMPLER_KUS:            sols = SolutionRetriver.get_solution_from_kus(*topass_withseed)        elif sampler_type == SAMPLER_DISTAWARE:            sols = SolutionRetriver.get_solution_from_dist_aware(*topass_withseed)        else:            print("Error: No such sampler!")            exit(-1)        # clean up the solutions        for sol in range(len(sols)):            sols[sol] = sols[sol].strip()            if sols[sol].endswith(' 0'):                sols[sol] = sols[sol][:-2]        print("Number of solutions returned by sampler:", len(sols))        # if args.verbose:        # print("Solutions:", sols)        return sols    @staticmethod    def get_solution_from_unigen(input_file, num_solutions, ind_var_list, new_seed):        # must construct ./unigen --samples=500 --verbosity=0 --threads=1  CNF-FILE SAMPLESFILE        input_file_suffix = input_file.split('/')[-1][:-4]        temp_output_file = tempfile.gettempdir() + '/' + input_file_suffix + ".txt"        cmd = './samplers/unigen --samples=' + str(num_solutions)        cmd += ' ' + input_file + ' ' + str(temp_output_file) + ' > /dev/null 2>&1'        if args.verbose:            print("cmd: ", cmd)        os.system(cmd)        with open(temp_output_file, 'r') as f:            lines = f.readlines()        sol_list = []        for line in lines:            line = line.strip()            if line.startswith('v'):                freq = int(line.split(':')[-1])                for i in range(freq):                    sol_list.append(line.split(':')[0].replace('v', '').strip())                    if len(sol_list) == num_solutions:                        break                if len(sol_list) == num_solutions:                    break        solreturn_list = sol_list        if len(sol_list) > num_solutions:            solreturn_list = random.sample(sol_list, num_solutions)        os.unlink(str(temp_output_file))        return solreturn_list    @staticmethod    def get_solution_from_unigen2(input_file, num_solutions, ind_var_list, new_seed):        input_file_suffix = input_file.split('/')[-1][:-4]        temp_output_file = tempfile.gettempdir() + '/' + input_file_suffix + ".txt"        cwd = os.getcwd()        cmd = 'python3  UniGen2.py -samples=' + str(num_solutions)        cmd += ' ' + str(os.path.abspath(input_file)) + ' ' + str(tempfile.gettempdir()) + ' > /dev/null 2>&1'        if args.verbose:            print("cmd: ", cmd)        os.chdir(str(os.getcwd()) + '/samplers')        os.system(cmd)        os.chdir(str(cwd))        with open(temp_output_file, 'r') as f:            lines = f.readlines()        sol_list = []        for line in lines:            line = line.strip()            if line.startswith('v'):                freq = int(line.split(':')[-1])                for i in range(freq):                    sol_list.append(line.split(':')[0].replace('v', '').strip())                    if len(sol_list) == num_solutions:                        break                if len(sol_list) == num_solutions:                    break        solreturn_list = sol_list        if len(sol_list) > num_solutions:            solreturn_list = random.sample(sol_list, num_solutions)        os.unlink(str(temp_output_file))        return solreturn_list    @staticmethod    def get_solution_from_kus(input_file, num_solutions, ind_var_list, new_seed):        input_file_suffix = input_file.split('/')[-1][:-4]        temp_output_file = tempfile.gettempdir() + '/' + input_file_suffix + ".txt"        cwd = os.getcwd()        cmd = 'python3  KUS.py --samples=' + str(num_solutions) + ' ' + '--outputfile ' + temp_output_file        cmd += ' ' + str(os.path.abspath(input_file)) + ' > /dev/null 2>&1'        if args.verbose:            print("cmd: ", cmd)        os.chdir(str(os.getcwd()) + '/samplers')        os.system(cmd)        os.chdir(str(cwd))        with open(temp_output_file, 'r') as f:            lines = f.readlines()        sol_list = []        for line in lines:            sol = re.sub('[0-9]*,', '', line)            sol_list.append(sol)        os.unlink(str(temp_output_file))        return sol_list    @staticmethod    def get_solution_from_unigen3(input_file, num_solutions, ind_var_list, new_seed):        # must construct: ./approxmc3 -s 1 -v2 --sampleout /dev/null --samples 500        input_file_suffix = input_file.split('/')[-1][:-4]        temp_output_file = tempfile.gettempdir() + '/' + input_file_suffix + ".txt"        cmd = './samplers/approxmc3 -s ' + str(int(new_seed)) + ' -v 0 --samples ' + str(num_solutions)        cmd += ' --sampleout ' + str(temp_output_file)        cmd += ' ' + input_file + ' > /dev/null 2>&1'        if args.verbose:            print("cmd: ", cmd)        os.system(cmd)        with open(temp_output_file, 'r') as f:            lines = f.readlines()        sol_list = []        for line in lines:            line = line.strip()            freq = int(line.split(':')[0])            for i in range(freq):                sol_list.append(line.split(':')[1].strip())                if len(sol_list) == num_solutions:                    break            if len(sol_list) == num_solutions:                break        solreturn_list = sol_list        if len(sol_list) > num_solutions:            solreturn_list = random.sample(sol_list, num_solutions)        os.unlink(str(temp_output_file))        return solreturn_list    @staticmethod    def get_solution_from_dist_aware(input_file, num_solutions, ind_var_list, new_seed):        input_file_suffix = input_file.split('/')[-1][:-4]        temp_output_file = tempfile.gettempdir() + '/' + input_file_suffix + ".txt"        # creating the file to configure the sampler        dbs_config_file = tempfile.gettempdir() + '/' + input_file_suffix + ".a"        with open(dbs_config_file, 'w+') as f:            f.write("log " + tempfile.gettempdir() + '/' + "output.txt" + "\n")            f.write("dimacs " + str(os.path.abspath(input_file)) + "\n")            params = " solver z3" + "\n"            params += "hybrid distribution-aware distance-metric:manhattan distribution:uniform onlyBinary:true " \                      "onlyNumeric:false "            params += " selection:SolverSelection number-weight-optimization:1"            params += " numConfigs:" + str(num_solutions)            f.write(params + "\n")            f.write("printconfigs " + temp_output_file)        cmd = "mono ./samplers/distribution-aware/CommandLine.exe "        cmd += dbs_config_file        if args.verbose:            print("cmd: ", cmd)        os.system(cmd)        with open(temp_output_file, 'r') as f:            lines = f.readlines()        sol_list = []        for line in lines:            features = re.findall("%\w+%", line)            sol = []            for feature in features:                feat = feature[1:-1]                sol.append(feat)            solution = ''            for k, v in features_dict.items():                if k in sol:                    solution += ' ' + str(v)                else:                    solution += ' -' + str(v)            sol_list.append(solution)        # cleaning temporary files        os.unlink(str(temp_output_file))        os.unlink(dbs_config_file)        os.unlink(str(tempfile.gettempdir()) + '/' + "output.txt")        os.unlink(str(tempfile.gettempdir()) + '/' + "output.txt_error")        return sol_list    @staticmethod    def get_solution_from_quicksampler(input_file, num_solutions, ind_var_list, new_seed):        cmd = "./samplers/quicksampler -n " + str(num_solutions * 5) + ' ' + str(input_file) + ' > /dev/null 2>&1'        if args.verbose:            print("cmd: ", cmd)        os.system(cmd)        cmd = "./samplers/z3-quicksampler/z3 sat.quicksampler_check=true sat.quicksampler_check.timeout=3600.0 " + str(            input_file) + ' > /dev/null 2>&1'        # os.system(cmd)        # cmd = "./samplers/z3 "+str(input_file)#+' > /dev/null 2>&1'        if args.verbose:            print("cmd: ", cmd)        os.system(cmd)        if num_solutions > 1:            i = 0        with open(input_file + '.samples', 'r') as f:            lines = f.readlines()        with open(input_file + '.samples.valid', 'r') as f:            valid_lines = f.readlines()        sol_list = []        for j in range(len(lines)):            if valid_lines[j].strip() == '0':                continue            fields = lines[j].strip().split(':')            sol = ''            i = 0            # valuations are 0 and 1 and in the same order as c ind.            for x in list(fields[1].strip()):                if x == '0':                    sol += ' -' + str(ind_var_list[i])                else:                    sol += ' ' + str(ind_var_list[i])                i += 1            sol_list.append(sol)            if len(sol_list) == num_solutions:                break        os.unlink(input_file + '.samples')        os.unlink(input_file + '.samples.valid')        if len(sol_list) != num_solutions:            print("Did not find required number of solutions")            sys.exit(1)        return sol_list    @staticmethod    def get_solution_from_spur(input_file, num_solutions, ind_var_list, new_seed):        input_file_suffix = input_file.split('/')[-1][:-4]        temp_output_file = tempfile.gettempdir() + '/' + input_file_suffix + ".out"        cmd = './samplers/spur -seed %d -q -s %d -out %s -cnf %s' % (            new_seed, num_solutions, temp_output_file, input_file)        if args.verbose:            print("cmd: ", cmd)        os.system(cmd)        with open(temp_output_file, 'r') as f:            lines = f.readlines()        sol_list = []        start_parse = False        for line in lines:            if line.startswith('#START_SAMPLES'):                start_parse = True                continue            if not start_parse:                continue            if line.startswith('#END_SAMPLES'):                start_parse = False                continue            fields = line.strip().split(',')            sol_count = int(fields[0])            sol = ' '            i = 1            for x in list(fields[1]):                if x == '0':                    sol += ' -' + str(i)                else:                    sol += ' ' + str(i)                i += 1            for i in range(sol_count):                sol_list.append(sol)        os.unlink(temp_output_file)        return sol_list    @staticmethod    def get_solution_from_sts(input_file, num_solutions, ind_var_list, new_seed):        k_value = 50        sampling_rounds = num_solutions / k_value + 1        input_file_suffix = input_file.split('/')[-1][:-4]        output_file = tempfile.gettempdir() + '/' + input_file_suffix + ".out"        cmd = './samplers/STS -k=' + str(k_value) + ' -nsamples=' + str(sampling_rounds) + ' ' + str(input_file)        cmd += ' > ' + str(output_file)        if args.verbose:            print("cmd: ", cmd)        os.system(cmd)        with open(output_file, 'r') as f:            lines = f.readlines()        sol_list = []        should_start = False        # baseList = {}        for j in range(len(lines)):            if lines[j].strip() == 'Outputting samples:' or lines[j].strip() == 'start':                should_start = True                continue            if lines[j].strip().startswith('Log') or lines[j].strip() == 'end':                should_start = False            if should_start:                '''if lines[j].strip() not in baseList:                    baseList[lines[j].strip()] = 1                else:                    baseList[lines[j].strip()] += 1'''                sol = ''                i = 0                # valuations are 0 and 1 and in the same order as c ind.                for x in list(lines[j].strip()):                    if x == '0':                        sol += ' -' + str(ind_var_list[i])                    else:                        sol += ' ' + str(ind_var_list[i])                    i += 1                sol_list.append(sol)                if len(sol_list) == num_solutions:                    break        if len(sol_list) != num_solutions:            print(len(sol_list))            print("STS Did not find required number of solutions")            sys.exit(1)        os.unlink(output_file)        return sol_list    @staticmethod    def get_solution_from_cms_sampler(input_file, num_solutions, ind_var_list, new_seed):        input_file_suffix = input_file.split('/')[-1][:-4]        output_file = tempfile.gettempdir() + '/' + input_file_suffix + ".out"        cmd = "./samplers/cryptominisat5 --restart luby --maple 0 --verb 10 --nobansol"        cmd += " --scc 1 -n1 --presimp 0 --polar rnd --freq 0.9999"        cmd += " --random " + str(int(new_seed)) + " --maxsol " + str(num_solutions)        cmd += " " + input_file        cmd += " --dumpresult " + output_file + " > /dev/null 2>&1"        if args.verbose:            print("cmd: ", cmd)        os.system(cmd)        with open(output_file, 'r') as f:            lines = f.readlines()        sol_list = []        for line in lines:            if line.strip() == 'SAT':                continue            sol = ""            lits = line.split(" ")            for y in ind_var_list:                if str(y) in lits:                    sol += ' ' + str(y)                if "-" + str(y) in lits:                    sol += ' -' + str(y)            sol_list.append(sol)        solreturn_list = sol_list        if len(sol_list) > num_solutions:            solreturn_list = random.sample(sol_list, num_solutions)        if len(sol_list) < num_solutions:            print("cryptominisat5 Did not find required number of solutions")            sys.exit(1)        os.unlink(output_file)        return solreturn_list    @staticmethod    def get_solution_from_smarch(input_file, num_solutions, ind_var_list, new_seed):        cmd = "python3 ./samplers/smarch_mp.py -p " + str(P_THREADS) + " -o " + os.path.dirname(            input_file) + " " + input_file + " " + str(num_solutions) + " > /dev/null 2>&1"        if args.verbose:            print("cmd: ", cmd)        os.system(cmd)        # if (num_solutions > 1):        #   i = 0        sol_list = []        temp_file = input_file.replace('.cnf', '_' + str(num_solutions)) + '.samples'        if args.verbose:            print(temp_file)        df = pd.read_csv(temp_file, header=None)        # with open(input_file+'.samples', 'r') as f:        #   lines = f.readlines()        for x in df.values:            # tmpLst = []            lst = x.tolist()            sol = ''            for i in lst:                if not math.isnan(i):                    sol += ' ' + str(int(i))            # tmpList = [str(int(i)) for i in lst if not math.isnan(i)]        # if args.verbose:        #    print(sol)        # sol_list.append(tmpList)        # sol_list = [x for x in df.values]        os.unlink(temp_file)        sol_list.append(sol)        return sol_list# returns List of Independent Variablesdef parse_ind_support(ind_support_file):    with open(ind_support_file, 'r') as f:        lines = f.readlines()    ind_list = []    num_vars = 0    for line in lines:        if line.startswith('p cnf'):            fields = line.split()            num_vars = int(fields[2])        if line.startswith('c ind'):            line = line.strip().replace('c ind', '').replace(' 0', '').strip().replace('v ', '')            ind_list.extend(line.split())    if len(ind_list) == 0:        ind_list = [int(x) for x in range(1, num_vars + 1)]    else:        ind_list = [int(x) for x in ind_list]    return ind_listdef chain_formula_setup(sample_sol, unif_sol, num_solutions):    # number of solutions for each: k1, k2, k3    # TODO rename to chainSolutions    count_list = [5, 5, 5]    # chain formula number of variables for each    # TODO rename to chainVars    new_var_list = [4, 4, 4]    ##########    # clean up the solutions    ##########    sample_sol = sample_sol[0].strip()    if sample_sol.endswith(' 0'):        sample_sol = sample_sol[:-2]    unif_sol = unif_sol[0].strip()    if unif_sol.endswith(' 0'):        unif_sol = unif_sol[:-2]    # adding more chain formulas (at most 8 in total: 3 + 5)    # these chain formulas will have 31 solutions over 6 variables    len_sol = len(sample_sol.split())    for ix in range(min(int(math.log(num_solutions, 2)) + 4, len_sol - 3, 5)):        count_list.append(31)        new_var_list.append(6)    assert len(count_list) == len(new_var_list)    # picking selector literals, ix.e. k1, k2, k3, randomly    if args.verbose:        print("len count list: " + str(len(count_list)))        print("#num of samples" + str(len(sample_sol.split())))    assert len(sample_sol.split()) > len(count_list), "There are not enough samples to proceed, sampler failed ?"    sample_lit_list = random.sample(sample_sol.split(), len(count_list))    unif_lit_list = []    unif_sol_map = unif_sol.split()    # from the last version of barbarik...    if CURR_REF_SAMPLER == SAMPLER_SPUR:        for lit in sample_lit_list:            unif_lit_list.append(unif_sol_map[abs(int(lit)) - 1])    else:        # since the reference is not always spur, some adapations are required here        for lit in sample_lit_list:            if lit in unif_sol_map:                unif_lit_list.append(lit)            elif int(lit) > 0 and str('-' + lit) in unif_sol_map:                unif_lit_list.append(str('-' + lit))            elif int(lit) < 0 and str(abs(int(lit))) in unif_sol_map:                unif_lit_list.append(str(abs(int(lit))))            else:                print("ERROR in Sampling ! ")        # print("appending: " +  unif_sol_map[abs(int(lit))-1]+  " for "+  lit)        # unif_lit_list.append(unif_sol_map[abs(int(lit))-1])    assert len(unif_lit_list) == len(sample_lit_list)    # print(unif_lit_list)    # print(sample_lit_list)    for a, b in zip(unif_lit_list, sample_lit_list):        assert abs(int(a)) == abs(int(b))    indicator_lits = []    indicator_lits.append(sample_lit_list)    indicator_lits.append(unif_lit_list)    # print("count_list:", count_list)    # print("new_var_list:", new_var_list)    # print("indicator_lits:", indicator_lits)    return ChainFormulaSetup(count_list, new_var_list, indicator_lits)def push_var(variable, cnf_clauses):    cnf_len = len(cnf_clauses)    for ix in range(cnf_len):        cnf_clauses[ix].append(variable)    return cnf_clausesdef get_cnf(variable, bin_str, sign, orig_total_vars):    cnf_clauses = []    bin_len = len(bin_str)    if sign is False:        cnf_clauses.append([-(bin_len + 1 + orig_total_vars)])    else:        cnf_clauses.append([bin_len + 1 + orig_total_vars])    for i in range(bin_len):        new_var = int(bin_len - i + orig_total_vars)        if sign is False:            new_var = -1 * (bin_len - i + orig_total_vars)        if bin_str[bin_len - i - 1] == '0':            cnf_clauses.append([new_var])        else:            cnf_clauses = push_var(new_var, cnf_clauses)    push_var(variable, cnf_clauses)    return cnf_clausesdef construct_chain_formula(original_var, sol_count, new_var, orig_total_vars, invert):    assert type(sol_count) == int    bin_str = str(bin(int(sol_count)))[2:-1]    bin_len = len(bin_str)    for _ in range(new_var - bin_len - 1):        bin_str = '0' + bin_str    first_cnf_clauses = get_cnf(-int(original_var), bin_str, invert, orig_total_vars)    added_clause_num = 0    write_lines = ''    for cl in first_cnf_clauses:        added_clause_num += 1        for lit in cl:            write_lines += "%d " % lit        write_lines += '0\n'    return write_lines, added_clause_num# returns whether new file was created and the list of TMP+OLD independent variablesdef construct_new_cnf(input_file, temp_file, sample_sol, unif_sol, chain_formula_conf, ind_var_list):    # which variables are in pos/neg value in the sample    sample_val = {}    for ix in sample_sol.strip().split():        ix = int(ix)        if ix != 0:            if abs(ix) not in ind_var_list:                continue            sample_val[abs(ix)] = int(ix / abs(ix))    # which variables are in pos/neg value in the uniform sample    unif_val = {}    diff_index = -1    for j in unif_sol.strip().split():        j = int(j)        if j != 0:            if abs(j) not in ind_var_list:                continue            unif_val[abs(j)] = int(j / abs(j))            if sample_val[abs(j)] != unif_val[abs(j)]:                diff_index = abs(j)    # the two solutions are the same    # can't do anything, let's do another experiment    if diff_index == -1:        return False, None, None    with open(input_file, 'r') as f:        lines = f.readlines()    # variables must be shifted by sum_new_var    sum_new_var = sum(chain_formula_conf.newVarList)    # emit the original CNF, but with shifted variables    shifted_cnf_str = ''    for line in lines:        line = line.strip()        if line.startswith('p cnf'):            num_var = int(line.split()[2])            num_cls = int(line.split()[3])            continue        if line.startswith('c'):            # comment            continue        for x in line.split():            x = int(x)            if x == 0:                continue            sign = int(x / abs(x))            shifted_cnf_str += "%d " % (sign * (abs(x) + sum_new_var))        shifted_cnf_str += ' 0\n'    del ix    # Fixing the solution based on splitting_var    # X = sigma1 OR X = singma2    # All variables are set except for the index where they last differ    sol_clause = ''    splitting_var = diff_index + sum_new_var    for var in ind_var_list:        if var != diff_index:            num_cls += 2            sol_clause += "%d " % (-splitting_var * sample_val[diff_index])            sol_clause += "%d 0\n" % (sample_val[var] * (var + sum_new_var))            sol_clause += "%d " % (-splitting_var * unif_val[diff_index])            sol_clause += "%d 0\n" % (unif_val[var] * (var + sum_new_var))    ##########    # We add the N number of chain formulas    # where chain_formula_conf.indicatorLits must be of size 2    # and len(chain_formula_conf.indicatorLits) == len(chain_formula_conf.newVarList)    # Adding K solutions over Z variables, where    #    Z = chain_formula_conf.newVarList[k]    #    K = chain_formula_conf.countList[k]    ##########    invert = True    seen_lits = {}    for indicLits in chain_formula_conf.indicatorLits:  # loop runs twice        current_num_var = 0        for ix in range(len(indicLits)):            newvar = chain_formula_conf.newVarList[ix]            indic_lit = int(indicLits[ix])            added_clause = ''            added_clause_num = 0            # not adding the chain formula twice to the same literal            if indic_lit not in seen_lits:                sign = int(indic_lit / abs(indic_lit))                added_clause, added_clause_num = construct_chain_formula(                    sign * (abs(indic_lit) + sum_new_var),                    chain_formula_conf.countList[ix], newvar, current_num_var,                    invert)            seen_lits[indic_lit] = True            current_num_var += newvar            num_cls += added_clause_num            sol_clause += added_clause        invert = not invert    del seen_lits    del invert    # create "c ind ..." lines    old_ind_var_list = [x + sum_new_var for x in ind_var_list]    temp_ind_var_list = copy.copy(old_ind_var_list)    ind_iter = 1    ind_str = 'c ind '    for ix in range(1, current_num_var + 1):        if ind_iter % 10 == 0:            ind_str += ' 0\nc ind '        ind_str += "%d " % ix        ind_iter += 1        temp_ind_var_list.append(ix)    for ix in old_ind_var_list:        if ind_iter % 10 == 0:            ind_str += ' 0\nc ind '        ind_str += "%d " % ix        ind_iter += 1    ind_str += ' 0\n'    # dump new CNF    with open(temp_file, 'w') as f:        f.write('p cnf %d %d\n' % (current_num_var + num_var, num_cls))        f.write(ind_str)        f.write(sol_clause)        # f.write("c -- old CNF below -- \n")        f.write(shifted_cnf_str)    # print("New file: ", temp_file)    # exit(0)    return True, temp_ind_var_list, old_ind_var_listclass Experiment:    def __init__(self, input_file, max_samples, min_samples, sampler_type, ref_sampler_type):        input_file_suffix = input_file.split('/')[-1][:-4]        self.tempFile = tempfile.gettempdir() + "/" + input_file_suffix + "_t.cnf"        self.indVarList = parse_ind_support(input_file)        self.inputFile = input_file        self.samplerType = sampler_type        self.maxSamples = max_samples        self.minSamples = min_samples        self.samplerString = get_sampler_string(sampler_type)        self.ref_sampler_type = ref_sampler_type    # Returns True if uniform and False otherwise    def test_uniformity(self, sol_list, ind_var_list):        sol_map = {}        base_map = {}        for sol in sol_list:            solution = ''            sol_fields = sol.split()            for entry in sol_fields:                if abs(int(entry)) in ind_var_list:                    solution += entry + ' '            if solution in sol_map.keys():                sol_map[solution] += 1            else:                sol_map[solution] = 1            if sol not in base_map.keys():                base_map[sol] = 1            else:                base_map[sol] += 1        if not bool(sol_map):            print("No Solutions were given to the test")            exit(1)        key = next(iter(sol_map))        print("baseMap: {:<6} num_solutions: {:<6} SolutionsCount: {:<6} loThresh: {:<6} hiThresh: {:<6}".format(            len(base_map.keys()), self.numSolutions, sol_map[key], self.loThresh, self.hiThresh))        if self.loThresh <= sol_map[key] <= self.hiThresh:            return True        else:            return False    def one_experiment(self, experiment, j, i, num_experiments, tj):        self.thresholdSolutions += self.numSolutions        if self.thresholdSolutions < self.minSamples:            return None, None        # generate a new seed value for every different (i,j,experiment)        new_seed = num_experiments * (i * tj + j) + experiment        # get sampler's solutions        sample_sol = SolutionRetriver.get_solution_from_sampler(            self.inputFile, 1, self.samplerType, self.indVarList, new_seed)        self.totalSolutionsGenerated += 1        # get uniform sampler's solutions        # get uniform sampler's solutions        # unif_sol = SolutionRetriver.get_solution_from_sampler(        #   self.input_file, 1, SAMPLER_SPUR, self.ind_var_list, new_seed)        # self.totalUniformSamples += 1        # The reference sampler is a now a parameter of barbarik        unif_sol = SolutionRetriver.get_solution_from_sampler(            self.inputFile, 1, self.ref_sampler_type, self.indVarList, new_seed)        self.totalUniformSamples += 1        chain_formula_conf = chain_formula_setup(sample_sol, unif_sol, self.numSolutions)        shakuni_mix, temp_ind_var_list, old_ind_var_list = construct_new_cnf(            self.inputFile, self.tempFile, sample_sol[0], unif_sol[0],            chain_formula_conf, self.indVarList)        # the two solutions were the same, couldn't construct CNF        if not shakuni_mix:            return False, None        # seed update        new_seed = new_seed + 1        # get sampler's solutions        sol_list = SolutionRetriver.get_solution_from_sampler(            self.tempFile, self.numSolutions, self.samplerType, temp_ind_var_list, new_seed)        os.unlink(self.tempFile)        self.totalSolutionsGenerated += self.numSolutions        is_uniform = self.test_uniformity(sol_list, old_ind_var_list)        print("sampler: {:<8s} i: {:<4d} isUniform: {:<4d} TotalSolutionsGenerated: {:<6d}".format(            self.samplerString, i, is_uniform,            self.totalSolutionsGenerated))        if not is_uniform:            print("exp:{4} RejectIteration:{0}  Loop:{1} TotalSolutionsGenerated:{2} TotalUniformSamples:{3}".format(                i, j, self.totalSolutionsGenerated, self.totalUniformSamples, experiment))            return True, True        if self.thresholdSolutions > self.maxSamples:            return True, True        return True, False''' To finalise the addition of the new sampler, you need to update arguments.   '''if __name__ == "__main__":    parser = argparse.ArgumentParser()    parser.add_argument('--eta', type=float, help="default = 0.9", default=0.9, dest='eta')    parser.add_argument('--epsilon', type=float, help="default = 0.3", default=0.3, dest='epsilon')    parser.add_argument('--delta', type=float, help="default = 0.05", default=0.05, dest='delta')    parser.add_argument('--sampler', type=int, help=str(SAMPLER_UNIGEN) + " for UniGen;\n" + str(        SAMPLER_UNIGEN3) + " for UniGen3 (AppMC3);\n" +                                                    str(SAMPLER_QUICKSAMPLER) + " for QuickSampler;\n" + str(        SAMPLER_STS) + " for STS;\n" + str(SAMPLER_CMS) + " for CMS;\n" +                                                    str(SAMPLER_SPUR) + " for SPUR;\n" + str(        SAMPLER_SMARCH) + " for SMARCH;\n" + str(SAMPLER_UNIGEN2) + " for UniGen2;\n" +                                                    str(SAMPLER_KUS) + " for KUS;\n" + str(        SAMPLER_DISTAWARE) + " for Distance-based Sampling;\n", default=SAMPLER_STS, dest='sampler')    parser.add_argument('--ref-sampler', type=int, help=str(SAMPLER_UNIGEN) + " for UniGen;\n" + str(        SAMPLER_UNIGEN3) + " for UniGen3 (AppMC3);\n" +                                                        str(SAMPLER_QUICKSAMPLER) + " for QuickSampler;\n" + str(        SAMPLER_STS) + " for STS;\n" + str(SAMPLER_CMS) + " for CMS;\n" +                                                        str(SAMPLER_SPUR) + " for SPUR;\n" + str(        SAMPLER_SMARCH) + " for SMARCH;\n" + str(SAMPLER_UNIGEN2) + " for UniGen2;\n" +                                                        str(SAMPLER_KUS) + " for KUS;\n" + str(        SAMPLER_DISTAWARE) + " for Distance-based Sampling;\n", default=SAMPLER_STS, dest='ref_sampler')    parser.add_argument('--reverse', type=int, default=0, help="order to search in", dest='searchOrder')    parser.add_argument('--min_samples', type=int, default=0, help="min samples", dest='min_samples')    parser.add_argument('--max_samples', type=int, default=sys.maxsize, help="max samples", dest='max_samples')    parser.add_argument('--seed', type=int, required=True, dest='seed')    parser.add_argument('--verb', type=int, dest='verbose')    parser.add_argument('--exp', type=int, help="number of experiments", dest='exp', default=1)    parser.add_argument("input", help="input file")    args = parser.parse_args()    inputFile = args.input    eta = args.eta    epsilon = args.epsilon    if eta < 2 * epsilon:        print("Eta needs to be at least two times epsilon")        exit(1)    delta = args.delta    numExperiments = args.exp    if numExperiments == -1:        numExperiments = sys.maxsize    searchOrder = args.searchOrder    verbose = args.verbose    seed = args.seed    random.seed(seed)    minSamples = args.min_samples    maxSamples = args.max_samples    # setting the current reference sampler    CURR_REF_SAMPLER = args.sampler    # preparing features list for distribution-aware sampling    if args.sampler == SAMPLER_DISTAWARE:        create_features_dict(inputFile)    totalLoops = int(math.ceil(math.log(2.0 / (eta + 2 * epsilon), 2)) + 1)    listforTraversal = range(totalLoops, 0, -1)    if searchOrder == 1:        listforTraversal = range(1, totalLoops + 1, 1)    exp = Experiment(        min_samples=minSamples, max_samples=maxSamples, input_file=inputFile,        sampler_type=args.sampler, ref_sampler_type=args.ref_sampler)    for experiment in range(numExperiments):        print("Experiment: {:<5} of {:>5}".format(experiment, numExperiments))        breakExperiment = False        exp.totalSolutionsGenerated = 0        exp.totalUniformSamples = 0        exp.thresholdSolutions = 0        for j in listforTraversal:            tj = math.ceil(                math.pow(2, j) * (2 * epsilon + eta) / ((eta - 2 * epsilon) ** 2) * math.log(4.0 / (eta + 2 * epsilon),                                                                                             2) * (                        4 * math.e / (math.e - 1) * math.log(1.0 / delta)))            beta = (math.pow(2, j - 1) + 1) * (eta + 2 * epsilon) * 1.0 / (                    4 + (2 * epsilon + eta) * (math.pow(2, j - 1) - 1))            gamma = (beta - 2 * epsilon) / 4            constantFactor = math.ceil(1 / (8.79 * gamma * gamma))            boundFactor = math.log((16) * (math.e / (math.e - 1)) * (1 / (delta * (eta - 2 * epsilon) ** 2)) * math.log(                4 / (eta + 2 * epsilon), 2) * math.log(1 / delta), 2)            print("constantFactor:{:<4} boundFactor: {:<20} logBoundFactor: {:<20}".format(                constantFactor, boundFactor, math.log(boundFactor, 2)))            print("tj: {:<6} totalLoops: {:<5} beta: {:<10} epsilon: {:<10}".format(                tj, totalLoops, beta, epsilon))            exp.numSolutions = int(math.ceil(constantFactor * boundFactor))            exp.loThresh = int((exp.numSolutions * 1.0 / 2) * (1 - (beta + 2 * epsilon) / 2))            exp.hiThresh = int((exp.numSolutions * 1.0 / 2) * (1 + (beta + 2 * epsilon) / 2))            print("num_solutions: {:<5} loThresh:{:<6} hiThresh: {:<6}".format(                exp.numSolutions, exp.loThresh, exp.hiThresh))            i = 0            breakExperiment = False            while i < int(tj) and not breakExperiment:                if args.verbose:                    print("*** Progress *** " + "i: " + str(i) + " j: " + str(j) + " ---- " + str(j * i) + " / " + str(                        len(listforTraversal) * tj))                i += 1                ok, breakExperiment = exp.one_experiment(experiment, j, i, numExperiments, tj)                if ok is None:                    continue                if not ok:                    i -= 1                    continue                if breakExperiment:                    break            if breakExperiment:                break        if not breakExperiment:            print("exp:{2} Accept:1 TotalSolutionsGenerated:{0} TotalUniformSamples:{1}".format(                exp.totalSolutionsGenerated,                exp.totalUniformSamples, experiment))        breakExperiment = False
